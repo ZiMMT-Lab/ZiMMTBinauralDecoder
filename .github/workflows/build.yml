@@ -1,0 +1,229 @@
+name: Build Plugin for All Platforms
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - name: macOS-arm64
+            os: macos-14
+            arch: arm64
+          - name: macOS-x86_64
+            os: macos-13
+            arch: x86_64
+          - name: Windows-x86_64
+            os: windows-latest
+            arch: x86_64
+          - name: Linux-x86_64
+            os: ubuntu-latest
+            arch: x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Dependencies (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            cmake \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libfreetype6-dev \
+            libxext-dev \
+            libgl1-mesa-dev \
+            libasound2-dev
+
+      # ===== macOS Signing Setup (only for macOS builds) =====
+      - name: Setup macOS Keychain and Certificates
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          # Create variables
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 32)
+          
+          # Import certificate from secrets
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o $CERTIFICATE_PATH
+          
+          # Create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          
+          # Import certificate to keychain
+          security import $CERTIFICATE_PATH -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+          
+          # Allow codesign to access the certificate without prompting
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          
+          # Debug: Verify certificate was imported
+          echo "Verifying certificate import..."
+          security find-identity -v $KEYCHAIN_PATH
+
+      - name: Save API Key for Notarization (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          ASC_API_KEY: ${{ secrets.ASC_API_KEY }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo -n "$ASC_API_KEY" | base64 --decode > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        shell: pwsh
+
+      - name: Configure CMake (macOS/Linux)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            ${{ matrix.arch == 'arm64' && '-DCMAKE_OSX_ARCHITECTURES=arm64' || '' }} \
+            ${{ matrix.arch == 'x86_64' && runner.os == 'macOS' && '-DCMAKE_OSX_ARCHITECTURES=x86_64' || '' }}
+        shell: bash
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # ===== macOS Signing & Notarization =====
+      - name: Sign and Notarize (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          # Find your Developer ID Application certificate identity
+          IDENTITY=$(security find-identity -v -p codesigning $RUNNER_TEMP/app-signing.keychain-db | grep "Developer ID Application" | head -1 | awk '{print $2}')
+          echo "Using identity: $IDENTITY"
+          
+          # Sign VST3 bundle
+          if [ -d "build/ZiMMTBinauralDecoder_artefacts/Release/VST3/ZiMMTBinauralDecoder.vst3" ]; then
+            echo "Signing VST3 bundle..."
+            codesign --force --deep --strict --timestamp \
+              --sign "$IDENTITY" \
+              --options runtime \
+              "build/ZiMMTBinauralDecoder_artefacts/Release/VST3/ZiMMTBinauralDecoder.vst3"
+            
+            # Verify VST3 signature
+            codesign --verify --deep --strict --verbose=2 "build/ZiMMTBinauralDecoder_artefacts/Release/VST3/ZiMMTBinauralDecoder.vst3"
+          fi
+          
+          # Sign Standalone app
+          if [ -d "build/ZiMMTBinauralDecoder_artefacts/Release/Standalone/ZiMMTBinauralDecoder.app" ]; then
+            echo "Signing Standalone app..."
+            codesign --force --deep --strict --timestamp \
+              --sign "$IDENTITY" \
+              --options runtime \
+              "build/ZiMMTBinauralDecoder_artefacts/Release/Standalone/ZiMMTBinauralDecoder.app"
+            
+            # Verify Standalone signature
+            codesign --verify --deep --strict --verbose=2 "build/ZiMMTBinauralDecoder_artefacts/Release/Standalone/ZiMMTBinauralDecoder.app"
+          fi
+          
+          # Create a zip for notarization
+          cd build/ZiMMTBinauralDecoder_artefacts/Release
+          zip -r "../../../ZiMMTDecoder-${{ matrix.name }}-signed.zip" VST3 Standalone
+          cd ../../..
+          
+          # Submit for notarization
+          echo "Submitting for notarization..."
+          xcrun notarytool submit "ZiMMTDecoder-${{ matrix.name }}-signed.zip" \
+            --issuer "$ASC_ISSUER_ID" \
+            --key-id "$ASC_KEY_ID" \
+            --key "~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8" \
+            --wait \
+            --timeout 30m
+          
+          # Staple the notarization ticket (for .app bundles only)
+          if [ -d "build/ZiMMTBinauralDecoder_artefacts/Release/Standalone/ZiMMTBinauralDecoder.app" ]; then
+            echo "Stapling notarization ticket to Standalone app..."
+            xcrun stapler staple "build/ZiMMTBinauralDecoder_artefacts/Release/Standalone/ZiMMTBinauralDecoder.app"
+          fi
+          
+          # Note: VST3 bundles cannot be stapled, but they will be recognized as notarized
+          
+          # Re-zip with stapled items
+          cd build/ZiMMTBinauralDecoder_artefacts/Release
+          zip -r "../../../ZiMMTDecoder-${{ matrix.name }}.zip" VST3 Standalone
+          cd ../../..
+          
+          echo "Signing and notarization complete!"
+
+      - name: Show full output tree (Windows)
+        if: runner.os == 'Windows'
+        run: tree build\ZiMMTBinauralDecoder_artefacts /F
+        shell: cmd
+
+      - name: Create artifact (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $src = "build/ZiMMTBinauralDecoder_artefacts/Release"
+          $zipName = "ZiMMTDecoder-${{ matrix.name }}.zip"
+          Compress-Archive -Path "$src/VST3", "$src/Standalone" -DestinationPath $zipName
+          echo "Created: $zipName"
+        shell: pwsh
+
+      - name: Create artifact (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd build/ZiMMTBinauralDecoder_artefacts/Release
+          zipName="ZiMMTDecoder-${{ matrix.name }}.zip"
+          zip -r "../../../$zipName" VST3 Standalone || echo "Nothing to zip"
+          echo "Created: $zipName"
+        shell: bash
+
+      # Clean up keychain (macOS only)
+      - name: Clean up keychain
+        if: runner.os == 'macOS' && always()
+        run: |
+          if [ -f "$RUNNER_TEMP/app-signing.keychain-db" ]; then
+            security delete-keychain $RUNNER_TEMP/app-signing.keychain-db
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZiMMTDecoder-${{ matrix.name }}
+          path: ZiMMTDecoder-${{ matrix.name }}.zip
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure
+        run: find artifacts -type f -name "*.zip" | head -10
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
